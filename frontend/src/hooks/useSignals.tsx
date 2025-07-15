@@ -1,60 +1,88 @@
 import { useEffect, useRef } from "react";
 
-/* ---------------- Packet type ---------------- */
+/* ---------- Packet type ---------- */
 type Packet = {
-  confusion: number;
-  gaze: { x: number; y: number } | null;
-  cursor: { x: number; y: number };
+  confusion: number;                          // Hume score 0-1
+  gaze:      { x: number; y: number } | null; // WebGazer coords
+  cursor:    { x: number; y: number };        // mouse coords
 };
 
-/* ---------------- Hook ----------------------- */
+/* Helper to wrap a JPEG frame in the JSON Hume expects */
+const makeFrameMsg = (jpegBase64: string) => ({
+  models: { face: {} },   // ask for Facial Expression model
+  data:   jpegBase64
+});
+
 export function useSignals() {
-  const conf   = useRef(0);                               // Hume score
-  const gaze   = useRef<Packet["gaze"]>(null);            // WebGazer
-  const cursor = useRef({ x: 0, y: 0 });                  // pointer
+  const conf   = useRef(0);
+  const gaze   = useRef<Packet["gaze"]>(null);
+  const cursor = useRef({ x: 0, y: 0 });
 
-  /* ---- 1. Hume confusion stream ---------------------- */
+  /* ---- 1.  Hume WebSocket + webcam frames ---- */
   useEffect(() => {
-    const Hume: any = (window as any).Hume;               // global from <script>
-    if (!Hume) { console.warn("Hume SDK not loaded"); return; }
+    const API_KEY = import.meta.env.VITE_HUME_API_KEY as string;
+    if (!API_KEY) { console.warn("No Hume API key"); return; }
 
-    const client = new Hume.HumeWebSDK({
-      apiKey: import.meta.env.VITE_HUME_API_KEY as string,
-      models: ["facial", "prosody"]                       // drop "prosody" for video-only
-    });
+    (async () => {
+      /* 1-a open webcam */
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const video  = Object.assign(document.createElement("video"), {
+        srcObject: stream,
+        muted: true,
+        playsInline: true
+      });
+      await video.play();
 
-    client.onPrediction((pred: any) => {
-      const score =
-        pred?.facial?.emotion?.confusion?.[0]?.score ?? 0;
-      conf.current = score;
-    });
+      /* 1-b helpers for frame capture */
+      const canvas = document.createElement("canvas");
+      const ctx    = canvas.getContext("2d")!;
 
-    client.connect().catch(console.error);
-    return () => client.disconnect();
+      /* 1-c open WebSocket */
+      const ws = new WebSocket(
+        `wss://api.hume.ai/v0/stream/models?apiKey=${API_KEY}`
+      );
+      ws.onopen = () => console.log("🟢 Hume WS open");
+
+      ws.onmessage = (e) => {
+        try {
+          const msg   = JSON.parse(e.data);
+          const score =
+            msg?.face?.predictions?.[0]?.emotions
+               ?.find((e: any) => e.name === "Confusion")?.score ?? 0;
+          conf.current = score;
+        } catch {/* ignore parse errors */}
+      };
+
+      /* 1-d send a frame twice per second */
+      const sendId = setInterval(() => {
+        if (video.videoWidth === 0) return;         // camera not ready
+        canvas.width  = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0);
+        const jpeg = canvas.toDataURL("image/jpeg").split(",")[1];
+        if (ws.readyState === 1) ws.send(JSON.stringify(makeFrameMsg(jpeg)));
+      }, 500);
+
+      /* cleanup */
+      return () => {
+        clearInterval(sendId);
+        ws.close();
+        stream.getTracks().forEach(t => t.stop());
+      };
+    })().catch(console.error);
   }, []);
 
-  /* ---- 2. WebGazer gaze stream ----------------------- */
+  /* ---- 2.  WebGazer gaze ---- */
   useEffect(() => {
     const g: any = (window as any).webgazer;
     if (!g) { console.warn("WebGazer missing"); return; }
 
-    g.showPredictionPoints(true);                         // tiny dot for debug
-
-    const readyCheck = setInterval(() => {
-      if (g.isReady && g.isReady()) {
-        console.log("✅ WebGazer ready");
-        clearInterval(readyCheck);
-      }
-    }, 500);
-
     g.setGazeListener((d: any) => {
       if (d) gaze.current = { x: d.x, y: d.y };
     }).begin();
-
-    return () => clearInterval(readyCheck);
   }, []);
 
-  /* ---- 3. Cursor coordinates ------------------------- */
+  /* ---- 3.  Cursor coords ---- */
   useEffect(() => {
     const handler = (e: PointerEvent) =>
       (cursor.current = { x: e.clientX, y: e.clientY });
@@ -62,7 +90,7 @@ export function useSignals() {
     return () => window.removeEventListener("pointermove", handler);
   }, []);
 
-  /* ---- 4. Send packet to Flask every 500 ms ---------- */
+  /* ---- 4.  Emit packet to Flask every 500 ms ---- */
   useEffect(() => {
     const id = setInterval(() => {
       const packet: Packet = {
@@ -71,7 +99,7 @@ export function useSignals() {
         cursor: cursor.current
       };
 
-      console.log("packet →", packet);                    // browser-side debug
+      console.log("packet →", packet);             // browser debug
 
       fetch("http://localhost:5050/signals", {
         method: "POST",

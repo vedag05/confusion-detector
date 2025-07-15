@@ -1,4 +1,3 @@
-<!-- frontend/index.html -->
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -6,16 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Confusion Detector</title>
   </head>
+
   <body>
     <div id="root"></div>
 
-    <!-- WebGazer global -->
+    <!-- WebGazer (adds global window.webgazer) -->
     <script src="https://cdn.jsdelivr.net/npm/webgazer/dist/webgazer.min.js"></script>
 
-    <!-- ✅ OFFICIAL Hume browser bundle -->
-    <script src="/hume.js"></script>
-
-    <!-- React entry -->
+    <!-- Your React / Vite bundle -->
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
