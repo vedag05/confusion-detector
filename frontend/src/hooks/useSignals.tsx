@@ -1,88 +1,104 @@
 import { useEffect, useRef } from "react";
 
-/* ---------- Packet type ---------- */
+/* ---------- Tunables ---------- */
+const INTERVAL_MS = 250;     // 0.25 s cadence
+const WINDOW_MS   = 1000;    // gaze history = 1 s
+const FIX_DIAG_PX = 80;      // ≤80 px box ⇒ fixation
+const NEED_PTS    = 2;       // min gaze points
+const TOP_N_EMOS  = 5;       // send up to 5 emotions
+
+/* ---------- Types ---------- */
+type Point = { x: number; y: number };
+type Emotion = { name: string; score: number };
 type Packet = {
-  confusion: number;                          // Hume score 0-1
-  gaze:      { x: number; y: number } | null; // WebGazer coords
-  cursor:    { x: number; y: number };        // mouse coords
+  confusion : number;
+  emotions  : Emotion[];
+  cursor    : Point;
+  gaze_last : Point | null;
+  gaze_box  : { x1: number; y1: number; x2: number; y2: number } | null;
+  gaze_pts  : number;
+  gaze_fix  : boolean;
 };
 
-/* Helper to wrap a JPEG frame in the JSON Hume expects */
-const makeFrameMsg = (jpegBase64: string) => ({
-  models: { face: {} },   // ask for Facial Expression model
-  data:   jpegBase64
-});
+/* ---------- Helper ---------- */
+const makeFrameMsg = (b64: string) => ({ models: { face: {} }, data: b64 });
 
 export function useSignals() {
-  const conf   = useRef(0);
-  const gaze   = useRef<Packet["gaze"]>(null);
-  const cursor = useRef({ x: 0, y: 0 });
+  const conf      = useRef(0);
+  const emotions  = useRef<Emotion[]>([]);
+  const cursor    = useRef<Point>({ x: 0, y: 0 });
+  const gazeLast  = useRef<Point | null>(null);
+  const gazeWin   = useRef<{ x: number; y: number; t: number }[]>([]);
 
-  /* ---- 1.  Hume WebSocket + webcam frames ---- */
+  /* ---- Hume WebSocket + webcam ---- */
   useEffect(() => {
     const API_KEY = import.meta.env.VITE_HUME_API_KEY as string;
-    if (!API_KEY) { console.warn("No Hume API key"); return; }
+    if (!API_KEY) return;
 
     (async () => {
-      /* 1-a open webcam */
       const stream = await navigator.mediaDevices.getUserMedia({ video: true });
       const video  = Object.assign(document.createElement("video"), {
-        srcObject: stream,
-        muted: true,
-        playsInline: true
+        srcObject: stream, muted: true, playsInline: true
       });
       await video.play();
 
-      /* 1-b helpers for frame capture */
       const canvas = document.createElement("canvas");
       const ctx    = canvas.getContext("2d")!;
 
-      /* 1-c open WebSocket */
       const ws = new WebSocket(
         `wss://api.hume.ai/v0/stream/models?apiKey=${API_KEY}`
       );
-      ws.onopen = () => console.log("🟢 Hume WS open");
 
       ws.onmessage = (e) => {
-        try {
-          const msg   = JSON.parse(e.data);
-          const score =
-            msg?.face?.predictions?.[0]?.emotions
-               ?.find((e: any) => e.name === "Confusion")?.score ?? 0;
-          conf.current = score;
-        } catch {/* ignore parse errors */}
+        const msg   = JSON.parse(e.data);
+        const emos  = msg?.face?.predictions?.[0]?.emotions ?? [];
+        // sort high→low score and keep top N
+        emotions.current = emos
+          .sort((a: any, b: any) => b.score - a.score)
+          .slice(0, TOP_N_EMOS)
+          .map((e: any) => ({ name: e.name, score: e.score }));
+
+        const confScore =
+          emotions.current.find((e) => e.name === "Confusion")?.score ?? 0;
+        conf.current = confScore;
       };
 
-      /* 1-d send a frame twice per second */
       const sendId = setInterval(() => {
-        if (video.videoWidth === 0) return;         // camera not ready
+        if (video.videoWidth === 0) return;
         canvas.width  = video.videoWidth;
         canvas.height = video.videoHeight;
         ctx.drawImage(video, 0, 0);
         const jpeg = canvas.toDataURL("image/jpeg").split(",")[1];
-        if (ws.readyState === 1) ws.send(JSON.stringify(makeFrameMsg(jpeg)));
-      }, 500);
+        ws.readyState === 1 && ws.send(JSON.stringify(makeFrameMsg(jpeg)));
+      }, INTERVAL_MS);
 
-      /* cleanup */
       return () => {
         clearInterval(sendId);
         ws.close();
-        stream.getTracks().forEach(t => t.stop());
+        stream.getTracks().forEach((t) => t.stop());
       };
-    })().catch(console.error);
+    })();
   }, []);
 
-  /* ---- 2.  WebGazer gaze ---- */
+  /* ---- WebGazer ---- */
   useEffect(() => {
     const g: any = (window as any).webgazer;
-    if (!g) { console.warn("WebGazer missing"); return; }
+    if (!g) return;
 
     g.setGazeListener((d: any) => {
-      if (d) gaze.current = { x: d.x, y: d.y };
+      if (!d) return;
+      const now = performance.now();
+      const p = { x: d.x, y: d.y, t: now };
+      gazeLast.current = { x: d.x, y: d.y };
+
+      gazeWin.current.push(p);
+      while (gazeWin.current[0]?.t < now - WINDOW_MS) {
+        gazeWin.current.shift();
+      }
     }).begin();
   }, []);
 
-  /* ---- 3.  Cursor coords ---- */
+  /* ---- cursor ---- */
   useEffect(() => {
     const handler = (e: PointerEvent) =>
       (cursor.current = { x: e.clientX, y: e.clientY });
@@ -90,23 +106,42 @@ export function useSignals() {
     return () => window.removeEventListener("pointermove", handler);
   }, []);
 
-  /* ---- 4.  Emit packet to Flask every 500 ms ---- */
+  /* ---- send packet ---- */
   useEffect(() => {
     const id = setInterval(() => {
-      const packet: Packet = {
-        confusion: conf.current,
-        gaze: gaze.current,
-        cursor: cursor.current
-      };
+      const gw = gazeWin.current;
+      let bbox: Packet["gaze_box"] = null;
+      let fixation = false;
 
-      console.log("packet →", packet);             // browser debug
+      if (gw.length) {
+        const xs = gw.map(p => p.x);
+        const ys = gw.map(p => p.y);
+        bbox = {
+          x1: Math.min(...xs),
+          y1: Math.min(...ys),
+          x2: Math.max(...xs),
+          y2: Math.max(...ys)
+        };
+        const diag = Math.hypot(bbox.x2 - bbox.x1, bbox.y2 - bbox.y1);
+        fixation   = diag <= FIX_DIAG_PX && gw.length >= NEED_PTS;
+      }
+
+      const packet: Packet = {
+        confusion : conf.current,
+        emotions  : emotions.current,
+        cursor    : cursor.current,
+        gaze_last : gazeLast.current,
+        gaze_box  : bbox,
+        gaze_pts  : gw.length,
+        gaze_fix  : fixation
+      };
 
       fetch("http://localhost:5050/signals", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(packet)
       }).catch(console.error);
-    }, 500);
+    }, INTERVAL_MS);
 
     return () => clearInterval(id);
   }, []);
