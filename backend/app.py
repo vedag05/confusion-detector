@@ -1,26 +1,43 @@
-# confusion-detector/backend/app.py
+# backend/app.py
 from flask import Flask, request
 from flask_jsonrpc import JSONRPC
-from flask_cors import CORS, cross_origin
+from flask_cors import CORS
+import threading, time, json
+from pathlib import Path
 
+# ---------- Flask plumbing ----------
 app = Flask(__name__)
-CORS(app, resources={r"/signals": {"origins": "http://localhost:5173"}},
-     supports_credentials=True)
+CORS(app, resources={r"/signals": {"origins": "http://localhost:5173"}})
 jsonrpc = JSONRPC(app, "/rpc")
 
-latest_packet: dict = {}
+# ---------- session log ----------
+LOG_DIR = Path("logs"); LOG_DIR.mkdir(exist_ok=True)
+log_file = (LOG_DIR / f"session_{time.strftime('%Y%m%d_%H%M%S')}.jsonl").open("w")
 
-@app.route("/signals", methods=["POST", "OPTIONS"])
-@cross_origin(origin="http://localhost:5173")           # CORS for dev
+def log(pkt: dict) -> None:
+    log_file.write(json.dumps(pkt) + "\n")
+    log_file.flush()
+
+# ---------- packet store ----------
+class Store:
+    def __init__(self):
+        self.latest: dict = {}
+    def update(self, pkt: dict):
+        self.latest = pkt
+        log(pkt)                      # write immediately
+store = Store()
+
+# ---------- routes ----------
+@app.route("/signals", methods=["POST"])
 def signals():
-    global latest_packet
-    latest_packet = request.json or {}
-    print("🎯", latest_packet)
+    store.update(request.json or {})
     return "", 204
 
 @jsonrpc.method("confusion.get_state")
 def get_state() -> dict:
-    return latest_packet
+    return store.latest
 
+# ---------- start ----------
 if __name__ == "__main__":
-    app.run(port=5050, debug=True)                      # use 5050
+    app.run(port=5050, debug=True)
+
